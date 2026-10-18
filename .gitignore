@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+session.json
+chrome_data/
+.env
+logs/
+*.har
+

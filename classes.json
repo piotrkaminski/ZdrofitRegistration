@@ -1,0 +1,19 @@
+{
+  "club": "zerniki-wroclawskie-zasluczanska",
+  "classes": [
+    {
+      "name": "Sztangi - Niedziela",
+      "exercise": "Sztangi",
+      "weekday": "Sunday",
+      "time": "08:30",
+      "enabled": true
+    },
+    {
+      "name": "HIIT - Środa",
+      "exercise": "HIIT",
+      "weekday": "Wednesday",
+      "time": "08:30",
+      "enabled": true
+    }
+  ]
+}
