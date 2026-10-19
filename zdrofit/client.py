@@ -42,29 +42,35 @@ def notify_session_expired():
     notify("Zdrofit", "Sesja wygasła - zapisy nie działają. Uruchom: python register.py --login")
 
 # In-page registration: fetch class modal for CSRF token, POST the form, then
-# re-fetch the modal to verify. Success is only reported when the class modal
-# itself confirms it (never by searching the POST response, which may be a
-# redirected schedule page mentioning other classes).
+# confirm via this class's own registration block (<div id="a{classId}">) in the
+# POST response, falling back to the registered-state modal at {classUrl}/zapisz.
+# Never search the whole page: every response contains e.g. ".sticky" CSS and
+# "#rezerwacja" links, and may list other classes marked "Zapisano".
 REGISTER_JS = """async ({ classId, classUrl }) => {
-    const fetchModal = async () => {
-        const resp = await fetch(classUrl, {
+    const fetchModal = async (url) => {
+        const resp = await fetch(url, {
             headers: { 'Accept': '*/*', 'X-Requested-With': 'XMLHttpRequest' },
             cache: 'no-store'
         });
         return { status: resp.status, html: await resp.text() };
     };
     const tokenRe = /name="schedule_register_form\\[_token\\]"\\s+value="([^"]+)"/i;
-    const isRegistered = (html) => html.includes('Wypisz się');
+    // Visible text of this class's registration block, e.g. "Zapisano Anuluj rezerwację"
+    const blockText = (html) => {
+        const m = html.match(new RegExp('id="a' + classId + '">([^]*?)</div>'));
+        return m ? m[1].replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim() : '';
+    };
+    const isRegistered = (html) => html.includes('Wypisz się') || blockText(html).includes('Zapisano');
 
     // Step 1: Fetch class modal HTML to extract CSRF token
-    const before = await fetchModal();
+    const before = await fetchModal(classUrl);
     if (before.status >= 400) {
         return { success: false, message: `Class modal request failed (HTTP ${before.status}).` };
     }
     const tokenMatch = before.html.match(tokenRe);
     if (!tokenMatch) {
         if (isRegistered(before.html)) {
-            return { success: true, message: 'Already registered (Wypisz się form present).' };
+            return { success: true, message: 'Already registered.' };
         }
         if (before.html.includes('Za wcześnie')) {
             return { success: false, early: true, message: 'Registration not open yet (Za wcześnie).' };
@@ -88,15 +94,21 @@ REGISTER_JS = """async ({ classId, classUrl }) => {
         return { success: false, htmlPreview: postHtml.slice(0, 400), message: `Registration POST failed (HTTP ${postResp.status}).` };
     }
 
-    // Step 3: Verify by re-fetching the class modal
-    const after = await fetchModal();
-    if (isRegistered(after.html)) {
+    // Step 3: Confirm via this class's block in the POST response
+    const block = blockText(postHtml);
+    if (block.includes('Zapisano')) {
+        return { success: true, message: `Successfully registered (${block}).` };
+    }
+    if (/rezerwow/i.test(block) && !block.includes('Zapisz się')) {
+        return { success: true, standby: true, message: `Added to standby/reserve list (${block}).` };
+    }
+
+    // Step 4: Fallback - the registered-state modal shows the "Wypisz się" form
+    const after = await fetchModal(classUrl.replace(/\\/+$/, '') + '/zapisz');
+    if (after.html.includes('Wypisz się')) {
         return { success: true, message: 'Successfully registered (verified: Wypisz się present).' };
     }
-    if (!tokenRe.test(after.html) && /rezerwow/i.test(after.html)) {
-        return { success: true, standby: true, message: 'Added to standby/reserve list (Lista rezerwowa).' };
-    }
-    return { success: false, htmlPreview: postHtml.slice(0, 400), message: 'Registration not confirmed by class modal.' };
+    return { success: false, htmlPreview: postHtml.slice(0, 400), message: `Registration not confirmed (class status: '${block || 'unknown'}').` };
 }"""
 
 class ZdrofitClass:
