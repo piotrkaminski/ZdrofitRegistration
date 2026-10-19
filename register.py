@@ -223,7 +223,8 @@ Examples:
         client.wait_and_register(
             date_str=args.date,
             time_str=args.time,
-            exercise_query=args.exercise
+            exercise_query=args.exercise,
+            dry_run=args.dry_run
         )
         return
 
@@ -233,6 +234,10 @@ Examples:
         if not target_class:
             print(f"[-] No class matching '{args.exercise}' found on {target_day_str} at {args.time}.")
             sys.exit(1)
+
+        if args.dry_run:
+            print(f"[!] Dry-run enabled: would register for {target_class}.")
+            return
 
         res = client.register_now(target_class)
         print(f"\nResult: {res}")

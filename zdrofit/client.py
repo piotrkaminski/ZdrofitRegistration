@@ -15,6 +15,64 @@ from .date_parser import parse_target_date, parse_weekday
 DEFAULT_CLUB = "zerniki-wroclawskie-zasluczanska"
 CHROME_MAC_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
+# In-page registration: fetch class modal for CSRF token, POST the form, then
+# re-fetch the modal to verify. Success is only reported when the class modal
+# itself confirms it (never by searching the POST response, which may be a
+# redirected schedule page mentioning other classes).
+REGISTER_JS = """async ({ classId, classUrl }) => {
+    const fetchModal = async () => {
+        const resp = await fetch(classUrl, {
+            headers: { 'Accept': '*/*', 'X-Requested-With': 'XMLHttpRequest' },
+            cache: 'no-store'
+        });
+        return { status: resp.status, html: await resp.text() };
+    };
+    const tokenRe = /name="schedule_register_form\\[_token\\]"\\s+value="([^"]+)"/i;
+    const isRegistered = (html) => html.includes('Wypisz się');
+
+    // Step 1: Fetch class modal HTML to extract CSRF token
+    const before = await fetchModal();
+    if (before.status >= 400) {
+        return { success: false, message: `Class modal request failed (HTTP ${before.status}).` };
+    }
+    const tokenMatch = before.html.match(tokenRe);
+    if (!tokenMatch) {
+        if (isRegistered(before.html)) {
+            return { success: true, message: 'Already registered (Wypisz się form present).' };
+        }
+        if (before.html.includes('Za wcześnie')) {
+            return { success: false, early: true, message: 'Registration not open yet (Za wcześnie).' };
+        }
+        return { success: false, htmlPreview: before.html.slice(0, 400), message: 'CSRF token not found in class response.' };
+    }
+
+    // Step 2: POST form data
+    const body = new URLSearchParams();
+    body.append('schedule_register_form[id]', classId);
+    body.append('schedule_register_form[_redirect]', '');
+    body.append('schedule_register_form[_token]', tokenMatch[1]);
+
+    const postResp = await fetch(classUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*' },
+        body: body.toString()
+    });
+    const postHtml = await postResp.text();
+    if (postResp.status >= 400) {
+        return { success: false, htmlPreview: postHtml.slice(0, 400), message: `Registration POST failed (HTTP ${postResp.status}).` };
+    }
+
+    // Step 3: Verify by re-fetching the class modal
+    const after = await fetchModal();
+    if (isRegistered(after.html)) {
+        return { success: true, message: 'Successfully registered (verified: Wypisz się present).' };
+    }
+    if (!tokenRe.test(after.html) && /rezerwow/i.test(after.html)) {
+        return { success: true, standby: true, message: 'Added to standby/reserve list (Lista rezerwowa).' };
+    }
+    return { success: false, htmlPreview: postHtml.slice(0, 400), message: 'Registration not confirmed by class modal.' };
+}"""
+
 class ZdrofitClass:
     def __init__(self, data: Dict[str, Any]):
         self.id = data.get("id", "")
@@ -282,6 +340,14 @@ class ZdrofitClient:
         matched_classes.sort(key=lambda x: x[0], reverse=True)
         return matched_classes[0][1]
 
+    def _register_in_page(self, page: Page, target_class: ZdrofitClass) -> Dict[str, Any]:
+        """Run one registration attempt inside the page; never raises."""
+        class_url = target_class.url or f"/kluby-fitness/{self.club_slug}/grafik-zajec/{target_class.id}"
+        try:
+            return page.evaluate(REGISTER_JS, {"classId": target_class.id, "classUrl": class_url})
+        except Exception as e:
+            return {"success": False, "message": f"Request error: {e}"}
+
     def register_now(self, target_class: ZdrofitClass) -> Dict[str, Any]:
         """
         Perform high-speed registration for target_class using in-page fetch + fallback.
@@ -309,56 +375,7 @@ class ZdrofitClient:
                 }
 
             # High-speed registration via in-page fetch
-            class_url = target_class.url or f"/kluby-fitness/{self.club_slug}/grafik-zajec/{target_class.id}"
-
-            reg_result = page.evaluate("""async ({ classId, classUrl }) => {
-                // Step 1: Fetch class modal HTML to extract CSRF token
-                const getResp = await fetch(classUrl, {
-                    headers: { 'Accept': '*/*', 'X-Requested-With': 'XMLHttpRequest' }
-                });
-                const getHtml = await getResp.text();
-
-                // Check for CSRF token
-                const tokenMatch = getHtml.match(/name="schedule_register_form\\[_token\\]"\\s+value="([^"]+)"/i);
-                if (!tokenMatch) {
-                    // Check if already registered
-                    if (getHtml.includes('Wypisz się')) {
-                        return { success: true, message: 'Already registered (Wypisz się form present).' };
-                    }
-                    if (getHtml.includes('Za wcześnie')) {
-                        return { success: false, early: true, message: 'Registration not open yet (Za wcześnie).' };
-                    }
-                    return { success: false, htmlPreview: getHtml.slice(0, 400), message: 'CSRF token not found in class response.' };
-                }
-
-                const csrfToken = tokenMatch[1];
-
-                // Step 2: POST form data
-                const body = new URLSearchParams();
-                body.append('schedule_register_form[id]', classId);
-                body.append('schedule_register_form[_redirect]', '');
-                body.append('schedule_register_form[_token]', csrfToken);
-
-                const postResp = await fetch(classUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Accept': '*/*'
-                    },
-                    body: body.toString()
-                });
-
-                const postHtml = await postResp.text();
-
-                if (postHtml.includes('Zapisano') || postHtml.includes('tick')) {
-                    return { success: true, message: 'Successfully registered (Zapisano)!' };
-                }
-                if (postHtml.includes('rezerwowa') || postHtml.includes('standby')) {
-                    return { success: true, standby: true, message: 'Added to standby/reserve list (Lista rezerwowa).' };
-                }
-
-                return { success: false, htmlPreview: postHtml.slice(0, 400), message: 'Registration response did not confirm registration.' };
-            }""", {"classId": target_class.id, "classUrl": class_url})
+            reg_result = self._register_in_page(page, target_class)
 
             browser.close()
             return reg_result
@@ -368,7 +385,8 @@ class ZdrofitClient:
         date_str: str,
         time_str: str,
         exercise_query: str,
-        early_connect_seconds: int = 15
+        early_connect_seconds: int = 15,
+        dry_run: bool = False
     ):
         """
         Wait until registration opens (48 hours before class start) and execute registration.
@@ -407,6 +425,10 @@ class ZdrofitClient:
 
         print(f"    Registration opens: {opens_at.strftime('%Y-%m-%d %H:%M:%S')} (48 hours before class)")
 
+        if dry_run:
+            print("[!] Dry-run enabled: skipping wait and registration.")
+            return False
+
         # If registration is already open
         if now >= opens_at:
             print("[+] Registration is already open! Registering immediately...")
@@ -442,8 +464,6 @@ class ZdrofitClient:
                 print("[-] Error: Not logged in. Please run 'python register.py --login' first.")
                 return False
 
-            class_url = target_class.url or f"/kluby-fitness/{self.club_slug}/grafik-zajec/{target_class.id}"
-
             # High precision countdown to opens_at
             while True:
                 diff = (opens_at - datetime.datetime.now()).total_seconds()
@@ -461,44 +481,7 @@ class ZdrofitClient:
             success = False
 
             while time.time() - start_snipe < 15:
-                reg_result = page.evaluate("""async ({ classId, classUrl }) => {
-                    const getResp = await fetch(classUrl, {
-                        headers: { 'Accept': '*/*', 'X-Requested-With': 'XMLHttpRequest' }
-                    });
-                    const getHtml = await getResp.text();
-
-                    const tokenMatch = getHtml.match(/name="schedule_register_form\\[_token\\]"\\s+value="([^"]+)"/i);
-                    if (!tokenMatch) {
-                        if (getHtml.includes('Wypisz się')) {
-                            return { success: true, message: 'Already registered.' };
-                        }
-                        if (getHtml.includes('Za wcześnie')) {
-                            return { success: false, early: true, message: 'Server says: Za wcześnie.' };
-                        }
-                        return { success: false, message: 'Token not found.' };
-                    }
-
-                    const csrfToken = tokenMatch[1];
-                    const body = new URLSearchParams();
-                    body.append('schedule_register_form[id]', classId);
-                    body.append('schedule_register_form[_redirect]', '');
-                    body.append('schedule_register_form[_token]', csrfToken);
-
-                    const postResp = await fetch(classUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*' },
-                        body: body.toString()
-                    });
-
-                    const postHtml = await postResp.text();
-                    if (postHtml.includes('Zapisano') || postHtml.includes('tick')) {
-                        return { success: true, message: 'Zapisano!' };
-                    }
-                    if (postHtml.includes('rezerwowa') || postHtml.includes('standby')) {
-                        return { success: true, standby: true, message: 'Lista rezerwowa!' };
-                    }
-                    return { success: false, message: 'Registration response failed.' };
-                }""", {"classId": target_class.id, "classUrl": class_url})
+                reg_result = self._register_in_page(page, target_class)
 
                 if reg_result.get("success"):
                     print(f"\n[+] SUCCESS at {datetime.datetime.now().strftime('%H:%M:%S.%f')}! {reg_result.get('message')}")
@@ -546,45 +529,7 @@ class ZdrofitClient:
                 return results
 
             for target_class in target_classes:
-                class_url = target_class.url or f"/kluby-fitness/{self.club_slug}/grafik-zajec/{target_class.id}"
-                reg_result = page.evaluate("""async ({ classId, classUrl }) => {
-                    const getResp = await fetch(classUrl, {
-                        headers: { 'Accept': '*/*', 'X-Requested-With': 'XMLHttpRequest' }
-                    });
-                    const getHtml = await getResp.text();
-
-                    const tokenMatch = getHtml.match(/name="schedule_register_form\\[_token\\]"\\s+value="([^"]+)"/i);
-                    if (!tokenMatch) {
-                        if (getHtml.includes('Wypisz się')) {
-                            return { success: true, message: 'Already registered.' };
-                        }
-                        if (getHtml.includes('Za wcześnie')) {
-                            return { success: false, early: true, message: 'Registration not open yet (Za wcześnie).' };
-                        }
-                        return { success: false, htmlPreview: getHtml.slice(0, 400), message: 'CSRF token not found in class response.' };
-                    }
-
-                    const csrfToken = tokenMatch[1];
-                    const body = new URLSearchParams();
-                    body.append('schedule_register_form[id]', classId);
-                    body.append('schedule_register_form[_redirect]', '');
-                    body.append('schedule_register_form[_token]', csrfToken);
-
-                    const postResp = await fetch(classUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*' },
-                        body: body.toString()
-                    });
-
-                    const postHtml = await postResp.text();
-                    if (postHtml.includes('Zapisano') || postHtml.includes('tick')) {
-                        return { success: true, message: 'Zapisano!' };
-                    }
-                    if (postHtml.includes('rezerwowa') || postHtml.includes('standby')) {
-                        return { success: true, standby: true, message: 'Lista rezerwowa!' };
-                    }
-                    return { success: false, htmlPreview: postHtml.slice(0, 400), message: 'Registration response failed.' };
-                }""", {"classId": target_class.id, "classUrl": class_url})
+                reg_result = self._register_in_page(page, target_class)
 
                 results[target_class.id] = reg_result
 
@@ -788,7 +733,8 @@ class ZdrofitClient:
                 self.wait_and_register(
                     date_str=next_c.day,
                     time_str=next_c.time,
-                    exercise_query=next_c.activity_title
+                    exercise_query=next_c.activity_title,
+                    dry_run=dry_run
                 )
             elif not wait_next:
                 print("💡 Wskazówka:")
