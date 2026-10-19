@@ -125,13 +125,13 @@ Examples:
 
         print("=== MODE 1: Multi-Class Periodic Sync (Recommended for classes.json) ===")
         print("Runs periodically in background. Any configured class entering the 48h window is booked automatically.")
-        print("Crontab (e.g. check every 30 minutes):")
+        print("Crontab (check every 5 minutes):")
         print("-------------------------------------------------------")
-        print(generate_sync_cron_command(config_path=args.config, interval_minutes=30))
+        print(generate_sync_cron_command(config_path=args.config, interval_minutes=5))
         print("-------------------------------------------------------")
-        print("Or macOS launchd plist (run every 30 minutes in background):")
+        print("Or macOS launchd plist (run every 5 minutes in background):")
         print("-------------------------------------------------------")
-        print(generate_sync_launchd_plist(config_path=args.config, interval_seconds=1800))
+        print(generate_sync_launchd_plist(config_path=args.config, interval_seconds=300))
         print("-------------------------------------------------------")
 
         print("\n=== MODE 2: Single-Class Precision Snipe (--wait) ===")

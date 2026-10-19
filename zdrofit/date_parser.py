@@ -1,6 +1,16 @@
 import datetime
+from zoneinfo import ZoneInfo
 from dateutil import parser
 import re
+
+# Zdrofit schedules are in Polish local time, regardless of this machine's timezone
+CLUB_TZ = ZoneInfo("Europe/Warsaw")
+
+
+def now_local() -> datetime.datetime:
+    """Current time as a timezone-aware datetime in the club's timezone."""
+    return datetime.datetime.now(CLUB_TZ)
+
 
 POLISH_ENGLISH_WEEKDAYS = {
     # 0 = Monday, ..., 6 = Sunday
@@ -31,7 +41,7 @@ def parse_target_date(date_str: str) -> datetime.date:
     if not date_str:
         raise ValueError("Empty date string provided")
 
-    now = datetime.datetime.now()
+    now = now_local()
     clean = date_str.lower().strip()
 
     if clean in ('today', 'dzisiaj', 'dzis', 'dziś'):

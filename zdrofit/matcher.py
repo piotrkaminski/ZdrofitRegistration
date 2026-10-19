@@ -28,12 +28,15 @@ def match_activity(query: str, target_slug: str, target_title: str) -> tuple[boo
     norm_slug = normalize_text(target_slug)
     norm_title = normalize_text(target_title)
 
-    # 1. Exact or substring match
-    if norm_query in norm_slug or norm_query in norm_title:
+    # 1. Exact match beats substring match (so 'hiit' prefers 'HIIT' over 'HIIT Kids')
+    if norm_query == norm_slug or norm_query == norm_title:
         return True, 1.0
 
-    if norm_slug in norm_query or norm_title in norm_query:
+    if norm_query in norm_slug or norm_query in norm_title:
         return True, 0.95
+
+    if norm_slug in norm_query or norm_title in norm_query:
+        return True, 0.9
 
     # 2. Fuzzy match against slug and title
     score_slug = difflib.SequenceMatcher(None, norm_query, norm_slug).ratio()

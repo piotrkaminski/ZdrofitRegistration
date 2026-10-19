@@ -1,6 +1,7 @@
-import os
+import shlex
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 LAUNCHD_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,18 +59,18 @@ def generate_launchd_plist(
     log_dir.mkdir(exist_ok=True)
 
     return LAUNCHD_TEMPLATE.format(
-        python_path=str(python_path),
-        script_path=str(script_path),
-        target_date=target_date,
-        target_time=target_time,
-        exercise=exercise,
-        club=club,
+        python_path=escape(str(python_path)),
+        script_path=escape(str(script_path)),
+        target_date=escape(target_date),
+        target_time=escape(target_time),
+        exercise=escape(exercise),
+        club=escape(club),
         weekday=run_weekday,
         hour=run_hour,
         minute=run_minute,
-        stdout_path=str(log_dir / "zdrofit_out.log"),
-        stderr_path=str(log_dir / "zdrofit_err.log"),
-        work_dir=str(work_dir)
+        stdout_path=escape(str(log_dir / "zdrofit_out.log")),
+        stderr_path=escape(str(log_dir / "zdrofit_err.log")),
+        work_dir=escape(str(work_dir))
     )
 
 def generate_cron_command(
@@ -88,9 +89,14 @@ def generate_cron_command(
     log_dir = work_dir / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    return f"{cron_minute} {cron_hour} * * {cron_weekday} cd {work_dir} && {python_path} {script_path} --date '{target_date}' --time '{target_time}' --exercise '{exercise}' --club '{club}' --wait >> {log_dir}/cron.log 2>&1"
+    q = shlex.quote
+    return (
+        f"{cron_minute} {cron_hour} * * {cron_weekday} cd {q(str(work_dir))} && {q(python_path)} {q(str(script_path))}"
+        f" --date {q(target_date)} --time {q(target_time)} --exercise {q(exercise)} --club {q(club)}"
+        f" --wait >> {q(str(log_dir / 'cron.log'))} 2>&1"
+    )
 
-def generate_sync_cron_command(config_path: str = "classes.json", interval_minutes: int = 30) -> str:
+def generate_sync_cron_command(config_path: str = "classes.json", interval_minutes: int = 5) -> str:
     """Generate cron command to run sync periodically."""
     work_dir = Path.cwd().resolve()
     python_path = sys.executable
@@ -98,15 +104,22 @@ def generate_sync_cron_command(config_path: str = "classes.json", interval_minut
     log_dir = work_dir / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    return f"*/{interval_minutes} * * * * cd {work_dir} && {python_path} {script_path} --config {config_path} --sync >> {log_dir}/sync_cron.log 2>&1"
+    q = shlex.quote
+    return (
+        f"*/{interval_minutes} * * * * cd {q(str(work_dir))} && {q(python_path)} {q(str(script_path))}"
+        f" --config {q(config_path)} --sync >> {q(str(log_dir / 'sync_cron.log'))} 2>&1"
+    )
 
-def generate_sync_launchd_plist(config_path: str = "classes.json", interval_seconds: int = 1800) -> str:
+def generate_sync_launchd_plist(config_path: str = "classes.json", interval_seconds: int = 300) -> str:
     """Generate launchd plist for periodic sync."""
     work_dir = Path.cwd().resolve()
     python_path = sys.executable
     script_path = work_dir / "register.py"
     log_dir = work_dir / "logs"
     log_dir.mkdir(exist_ok=True)
+    python_path, script_path, config_path, log_dir, work_dir = (
+        escape(str(v)) for v in (python_path, script_path, config_path, log_dir, work_dir)
+    )
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

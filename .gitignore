@@ -6,4 +6,4 @@ chrome_data/
 .env
 logs/
 *.har
-
+*.swp

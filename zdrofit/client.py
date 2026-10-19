@@ -4,16 +4,42 @@ import time
 import json
 import re
 import datetime
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
 
 from .matcher import match_activity, normalize_text
-from .date_parser import parse_target_date, parse_weekday
+from .date_parser import parse_target_date, parse_weekday, now_local, CLUB_TZ
 
 DEFAULT_CLUB = "zerniki-wroclawskie-zasluczanska"
 CHROME_MAC_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# Sync is scheduled every 5 minutes; auto-wait covers slightly more than one
+# interval so every registration opening is caught by a waiting run.
+AUTO_WAIT_WINDOW_SECONDS = 360
+FAR_FUTURE = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+NOT_LOGGED_IN_MSG = "Not logged in! Run with --login first to save your session."
+
+
+def notify(title: str, message: str):
+    """Show a macOS notification (best effort, no-op on other platforms)."""
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", "on run argv",
+             "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+             "-e", "end run", title, message],
+            check=False, capture_output=True, timeout=10
+        )
+    except Exception:
+        pass
+
+
+def notify_session_expired():
+    notify("Zdrofit", "Sesja wygasła - zapisy nie działają. Uruchom: python register.py --login")
 
 # In-page registration: fetch class modal for CSRF token, POST the form, then
 # re-fetch the modal to verify. Success is only reported when the class modal
@@ -92,7 +118,7 @@ class ZdrofitClass:
     @property
     def start_datetime(self) -> Optional[datetime.datetime]:
         try:
-            return datetime.datetime.strptime(f"{self.day} {self.time}", "%Y-%m-%d %H:%M")
+            return datetime.datetime.strptime(f"{self.day} {self.time}", "%Y-%m-%d %H:%M").replace(tzinfo=CLUB_TZ)
         except Exception:
             return None
 
@@ -100,8 +126,9 @@ class ZdrofitClass:
     def registration_opens_at(self) -> Optional[datetime.datetime]:
         dt = self.start_datetime
         if dt:
-            # Registration opens exactly 48 hours before class start
-            return dt - datetime.timedelta(hours=48)
+            # Registration opens 48 hours before class start, counted in Polish wall-clock
+            # time (Sunday 08:30 -> Friday 08:30, also across DST changes)
+            return (dt.replace(tzinfo=None) - datetime.timedelta(hours=48)).replace(tzinfo=CLUB_TZ)
         return None
 
     @property
@@ -110,9 +137,7 @@ class ZdrofitClass:
         dt = self.start_datetime
         if not dt:
             return False
-        now = datetime.datetime.now()
-        opens_at = dt - datetime.timedelta(hours=48)
-        return opens_at <= now < dt
+        return self.registration_opens_at <= now_local() < dt
 
     @property
     def is_past(self) -> bool:
@@ -120,7 +145,7 @@ class ZdrofitClass:
         dt = self.start_datetime
         if not dt:
             return False
-        return datetime.datetime.now() >= dt
+        return now_local() >= dt
 
     def __repr__(self):
         return f"<ZdrofitClass {self.day} {self.time} '{self.activity_title}' ({self.trainer}) [{self.status_text}] id={self.id}>"
@@ -369,10 +394,8 @@ class ZdrofitClient:
             # Check if user is logged in
             if not self.check_login(page):
                 browser.close()
-                return {
-                    "success": False,
-                    "error": "Not logged in! Run with --login first to save your session."
-                }
+                notify_session_expired()
+                return {"success": False, "error": NOT_LOGGED_IN_MSG}
 
             # High-speed registration via in-page fetch
             reg_result = self._register_in_page(page, target_class)
@@ -417,7 +440,7 @@ class ZdrofitClient:
             return True
 
         opens_at = target_class.registration_opens_at
-        now = datetime.datetime.now()
+        now = now_local()
 
         if opens_at is None:
             print("[-] Unable to determine registration opening time.")
@@ -462,11 +485,12 @@ class ZdrofitClient:
             if not self.check_login(page):
                 browser.close()
                 print("[-] Error: Not logged in. Please run 'python register.py --login' first.")
+                notify_session_expired()
                 return False
 
             # High precision countdown to opens_at
             while True:
-                diff = (opens_at - datetime.datetime.now()).total_seconds()
+                diff = (opens_at - now_local()).total_seconds()
                 if diff <= 0.05: # reached opening time!
                     break
                 if diff > 1.0:
@@ -474,7 +498,7 @@ class ZdrofitClient:
                 else:
                     time.sleep(0.02)
 
-            print(f"[!] {datetime.datetime.now().strftime('%H:%M:%S.%f')}: Registration opened! Submitting registration...")
+            print(f"[!] {now_local().strftime('%H:%M:%S.%f')}: Registration opened! Submitting registration...")
 
             # Retry loop for 15 seconds in case server clock is slightly off
             start_snipe = time.time()
@@ -484,11 +508,11 @@ class ZdrofitClient:
                 reg_result = self._register_in_page(page, target_class)
 
                 if reg_result.get("success"):
-                    print(f"\n[+] SUCCESS at {datetime.datetime.now().strftime('%H:%M:%S.%f')}! {reg_result.get('message')}")
+                    print(f"\n[+] SUCCESS at {now_local().strftime('%H:%M:%S.%f')}! {reg_result.get('message')}")
                     success = True
                     break
                 elif reg_result.get("early"):
-                    print(f"[*] Server reported early at {datetime.datetime.now().strftime('%H:%M:%S.%f')}. Retrying...")
+                    print(f"[*] Server reported early at {now_local().strftime('%H:%M:%S.%f')}. Retrying...")
                     time.sleep(0.3)
                 else:
                     print(f"[-] Attempt failed: {reg_result.get('message')}. Retrying...")
@@ -521,11 +545,9 @@ class ZdrofitClient:
 
             if not self.check_login(page):
                 browser.close()
+                notify_session_expired()
                 for c in target_classes:
-                    results[c.id] = {
-                        "success": False,
-                        "error": "Not logged in! Run with --login first to save your session."
-                    }
+                    results[c.id] = {"success": False, "error": NOT_LOGGED_IN_MSG}
                 return results
 
             for target_class in target_classes:
@@ -575,7 +597,7 @@ class ZdrofitClient:
             c_club = r.get("club", top_club)
             club_rules.setdefault(c_club, []).append(r)
 
-        now = datetime.datetime.now()
+        now = now_local()
         evaluation_results: List[Dict[str, Any]] = []
         classes_to_register: List[tuple[Any, ZdrofitClass, Dict[str, Any]]] = []
 
@@ -591,20 +613,42 @@ class ZdrofitClient:
 
             for rule in c_rules:
                 r_name = rule.get("name") or rule.get("exercise", "Unknown")
-                r_exercise = rule.get("exercise", "")
+                r_exercise = (rule.get("exercise") or "").strip()
                 r_time = rule.get("time", "")
                 r_weekday = rule.get("weekday")
                 r_date = rule.get("date")
 
-                norm_time = None
-                if r_time:
-                    parts = r_time.strip().split(":")
-                    norm_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                try:
+                    # An empty exercise would substring-match every class
+                    if not r_exercise:
+                        raise ValueError("missing 'exercise'")
 
-                target_wd = parse_weekday(r_weekday) if r_weekday is not None else None
-                target_day_str = parse_target_date(r_date).strftime("%Y-%m-%d") if r_date else None
+                    norm_time = None
+                    if r_time:
+                        hour, minute = r_time.strip().split(":")
+                        norm_time = f"{int(hour):02d}:{int(minute):02d}"
 
-                matched = []
+                    target_wd = None
+                    if r_weekday is not None:
+                        target_wd = parse_weekday(r_weekday)
+                        if target_wd is None:
+                            raise ValueError(f"unknown weekday '{r_weekday}'")
+
+                    target_day_str = parse_target_date(r_date).strftime("%Y-%m-%d") if r_date else None
+                except (ValueError, AttributeError, TypeError) as e:
+                    print(f"[!] Skipping invalid rule '{r_name}': {e}")
+                    evaluation_results.append({
+                        "rule": rule,
+                        "class": None,
+                        "client": fetch_client,
+                        "status": "INVALID",
+                        "details": f"Invalid rule: {e}"
+                    })
+                    continue
+
+                # Keep only the best-matching class per date, so similarly named
+                # classes in the same slot are not booked as well
+                best_per_day: Dict[str, tuple[float, ZdrofitClass]] = {}
                 for c in schedule:
                     if norm_time and c.time != norm_time:
                         continue
@@ -614,19 +658,20 @@ class ZdrofitClient:
                         continue
 
                     is_match, score = match_activity(r_exercise, c.activity_slug, c.activity_title)
-                    if is_match:
-                        matched.append((score, c))
+                    if is_match and (c.day not in best_per_day or score > best_per_day[c.day][0]):
+                        best_per_day[c.day] = (score, c)
 
-                if not matched:
+                if not best_per_day:
                     evaluation_results.append({
                         "rule": rule,
                         "class": None,
+                        "client": fetch_client,
                         "status": "NOT_FOUND",
                         "details": f"No class matching '{r_exercise}' at {r_time} in current schedule"
                     })
                     continue
 
-                matched_classes = [m[1] for m in sorted(matched, key=lambda x: x[1].start_datetime or datetime.datetime.max)]
+                matched_classes = sorted((c for _, c in best_per_day.values()), key=lambda c: c.start_datetime or FAR_FUTURE)
 
                 for c in matched_classes:
                     if c.is_past:
@@ -652,6 +697,7 @@ class ZdrofitClient:
                     evaluation_results.append({
                         "rule": rule,
                         "class": c,
+                        "client": fetch_client,
                         "status": st,
                         "details": details
                     })
@@ -706,31 +752,32 @@ class ZdrofitClient:
                 "IN_RANGE": "⏳ W ZAKRESIE",
                 "TOO_EARLY": "🕒 ZA WCZEŚNIE",
                 "NOT_FOUND": "❌ BRAK W GRAFIKU",
-                "FAILED": "⚠️ BŁĄD"
+                "FAILED": "⚠️ BŁĄD",
+                "INVALID": "⚠️ BŁĘDNA REGUŁA"
             }.get(status, status)
 
             print(f"{r_name:<22} | {ex:<16} | {dt_str:<16} | {status_display:<15} | {details}")
         print("=" * 90 + "\n")
 
-        # If wait_next is requested OR if a class opens imminently (within 5 minutes):
+        # If wait_next is requested OR if a class opens before the next scheduled sync run:
         too_early = [ev for ev in evaluation_results if ev["status"] == "TOO_EARLY" and ev["class"]]
         if too_early:
-            too_early.sort(key=lambda x: x["class"].registration_opens_at or datetime.datetime.max)
+            too_early.sort(key=lambda x: x["class"].registration_opens_at or FAR_FUTURE)
             next_class_ev = too_early[0]
             next_c = next_class_ev["class"]
-            time_until_open = (next_c.registration_opens_at - datetime.datetime.now()).total_seconds()
+            time_until_open = (next_c.registration_opens_at - now_local()).total_seconds()
 
-            # Trigger wait if explicitly requested (--wait) OR if opening is within 5 minutes (300s)
-            should_wait = wait_next or (0 < time_until_open <= 300 and not dry_run)
+            # Trigger wait if explicitly requested (--wait) OR if opening is within the auto-wait window
+            should_wait = wait_next or (0 < time_until_open <= AUTO_WAIT_WINDOW_SECONDS and not dry_run)
 
             if should_wait:
                 if not wait_next:
-                    print(f"[!] Zapisy na najbliższe zajęcia ({next_c.activity_title}) ruszają za mniej niż 5 minut ({int(time_until_open)}s)!")
+                    print(f"[!] Zapisy na najbliższe zajęcia ({next_c.activity_title}) ruszają za mniej niż {AUTO_WAIT_WINDOW_SECONDS // 60} minut ({int(time_until_open)}s)!")
                     print(f"[*] Automatycznie przełączam w tryb oczekiwania do godziny {next_c.registration_opens_at.strftime('%H:%M:%S')}...\n")
                 else:
                     print(f"[+] Najbliższe otwarcie zapisów: {next_c.activity_title} ({next_c.day} {next_c.time}) -> {next_c.registration_opens_at.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-                self.wait_and_register(
+                next_class_ev["client"].wait_and_register(
                     date_str=next_c.day,
                     time_str=next_c.time,
                     exercise_query=next_c.activity_title,
